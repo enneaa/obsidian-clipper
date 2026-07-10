@@ -24,6 +24,8 @@ import { addBrowserClassToHtml } from '../utils/browser-detection';
 import { initializeMenu } from '../managers/menu';
 import { addMenuItemListener } from '../managers/menu';
 import { translatePage, getCurrentLanguage, setLanguage, getAvailableLanguages, getMessage, setupLanguageAndDirection } from '../utils/i18n';
+import { getSettingsPlugins, SettingsPluginContext } from './plugin-system';
+import { initExtensions } from '../ext/index';
 
 declare global {
 	interface Window {
@@ -46,35 +48,51 @@ document.addEventListener('DOMContentLoaded', async () => {
 	document.getElementById(`${targetSection}-section`)?.classList.add('active');
 	document.querySelector(`#sidebar li[data-section="${targetSection}"]`)?.classList.add('active');
 
+	// Initialize sidebar first so users can navigate immediately
+	initializeSidebar();
+	initializeMenu('more-actions-btn', 'template-actions-menu');
+
 	async function initializeSettings(): Promise<void> {
 		try {
 			await translatePage();
 
-			await initializeGeneralSettings();
-			await initializeReaderSettings();
+			// Initialize core UI responsiveness first
+			initializeAutoSave();
+			initializeTemplateListeners();
+
+			// Run independent initializations in parallel
+			await Promise.all([
+				initializeGeneralSettings(),
+				initializeReaderSettings(),
+				loadTemplates().then(loadedTemplates => {
+					updateTemplateList(loadedTemplates);
+				}).catch(error => {
+					console.error('Error loading templates:', error);
+					updateTemplateList([]);
+				}),
+			]);
 			
-			// Initialize interpreter settings with error handling
+			// Initialize interpreter settings with error handling (network request may be slow)
 			try {
 				await initializeInterpreterSettings();
 			} catch (error) {
 				console.error('Error initializing interpreter settings, continuing with defaults:', error);
 			}
 			
-			// Load templates with error handling
-			let loadedTemplates;
-			try {
-				loadedTemplates = await loadTemplates();
-				updateTemplateList(loadedTemplates);
-			} catch (error) {
-				console.error('Error loading templates:', error);
-				// Continue with empty template list
-				updateTemplateList([]);
-			}
-			initializeTemplateListeners();
 			await handleUrlParameters();
-			initializeSidebar();
-			initializeAutoSave();
-			initializeMenu('more-actions-btn', 'template-actions-menu');
+
+			// Initialize extension plugins (cloud settings, etc.)
+			initExtensions();
+			const settingsCtx: SettingsPluginContext = { root: document.documentElement };
+			for (const plugin of getSettingsPlugins()) {
+				if (plugin.init) {
+					try {
+						await plugin.init(settingsCtx);
+					} catch (error) {
+						console.error(`Settings plugin ${plugin.id} init failed:`, error);
+					}
+				}
+			}
 
 			createIcons({ icons });
 

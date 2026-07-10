@@ -13,6 +13,8 @@ import browser from '../utils/browser-polyfill';
 import { addBrowserClassToHtml, detectBrowser } from '../utils/browser-detection';
 import { createElementWithClass } from '../utils/dom-utils';
 import { initializeInterpreter, handleInterpreterUI, collectPromptVariables } from '../utils/interpreter';
+import { getPopupPlugins, PopupPluginContext } from './plugin-system';
+import { initExtensions } from '../ext/index';
 import { adjustNoteNameHeight } from '../utils/ui-utils';
 import { debugLog } from '../utils/debug';
 import { showVariables, initializeVariablesPanel, updateVariablesPanel } from '../managers/inspect-variables';
@@ -288,6 +290,19 @@ document.addEventListener('DOMContentLoaded', async function() {
 		document.documentElement.classList.add('is-embedded');
 	}
 
+	// Initialize extension plugins (chat, cloud, etc.) and run their init hooks.
+	initExtensions();
+	const initCtx: PopupPluginContext = {};
+	for (const plugin of getPopupPlugins()) {
+		if (plugin.init) {
+			try {
+				await plugin.init(initCtx);
+			} catch (e) {
+				console.error(`Plugin ${plugin.id} init failed:`, e);
+			}
+		}
+	}
+
 	const isSidePanel = document.documentElement.classList.contains('is-side-panel');
 
 	try {
@@ -342,6 +357,9 @@ document.addEventListener('DOMContentLoaded', async function() {
 		// Connect to the background script for communication
 		browser.runtime.connect({ name: 'popup' });
 
+		// Initialize all Lucide icons in the popup
+		initializeIcons();
+
 		// Setup event listeners for popup buttons
 		const refreshButton = document.getElementById('refresh-pane');
 		if (refreshButton) {
@@ -365,7 +383,6 @@ document.addEventListener('DOMContentLoaded', async function() {
 					console.error('Error opening options page:', error);
 				}
 			});
-			initializeIcons(settingsButton);
 		}
 
 		// Initialize the rest of the popup
@@ -383,6 +400,22 @@ document.addEventListener('DOMContentLoaded', async function() {
 				await initializeUI();
 
 				determineMainAction();
+
+				// Update saveToCloud button label with translation from cloud plugin
+				if (loadedSettings.saveBehavior === 'saveToCloud') {
+					const cloudPlugin = getPopupPlugins().find(p => p.id === 'cloud');
+					if (cloudPlugin?.getSaveToCloudAction) {
+						try {
+							const action = await cloudPlugin.getSaveToCloudAction();
+							if (action) {
+								const mainButton = document.getElementById('clip-btn');
+								if (mainButton) mainButton.textContent = action.label;
+							}
+						} catch (e) {
+							console.warn('Failed to get cloud action label:', e);
+						}
+					}
+				}
 
 				const showMoreActionsButton = document.getElementById('show-variables');
 				if (showMoreActionsButton) {
@@ -967,6 +1000,21 @@ async function fillTemplateFieldValues(currentTabId: number, template: Template 
 		}
 	}
 
+	const pluginCtx: PopupPluginContext = {
+		tabId: currentTabId,
+		currentUrl: currentUrl,
+		variables: variables
+	};
+	for (const plugin of getPopupPlugins()) {
+		if (plugin.onTemplateChange) {
+			try {
+				await plugin.onTemplateChange(template, variables, pluginCtx);
+			} catch (e) {
+				console.error(`Plugin ${plugin.id} onTemplateChange failed:`, e);
+			}
+		}
+	}
+
 	const replacedTemplate = await getReplacedTemplate(template, variables, currentTabId!, currentUrl);
 	debugLog('Variables', 'Current template with replaced variables:', JSON.stringify(replacedTemplate, null, 2));
 }
@@ -1275,6 +1323,20 @@ async function handleSaveToDownloads() {
 	}
 }
 
+async function handleSaveToCloud(): Promise<void> {
+	const cloudPlugin = getPopupPlugins().find(p => p.id === 'cloud');
+	if (cloudPlugin?.getSaveToCloudAction) {
+		try {
+			const action = await cloudPlugin.getSaveToCloudAction();
+			if (action) {
+				await action.handler();
+			}
+		} catch (error) {
+			console.error('Failed to save to cloud:', error);
+		}
+	}
+}
+
 function determineMainAction() {
 	const mainButton = document.getElementById('clip-btn');
 	const moreDropdown = document.getElementById('more-dropdown');
@@ -1300,6 +1362,14 @@ function determineMainAction() {
 			addSecondaryAction(secondaryActions, 'addToObsidian', () => handleClipObsidian());
 			addSecondaryAction(secondaryActions, 'copyToClipboard', copyContent);
 			break;
+		case 'saveToCloud':
+			mainButton.textContent = 'Save to cloud';
+			mainButton.onclick = () => handleSaveToCloud();
+			// Add direct actions to secondary
+			addSecondaryAction(secondaryActions, 'addToObsidian', () => handleClipObsidian());
+			addSecondaryAction(secondaryActions, 'copyToClipboard', copyContent);
+			addSecondaryAction(secondaryActions, 'saveFile', handleSaveToDownloads);
+			break;
 		default: // 'addToObsidian'
 			mainButton.textContent = getMessage('addToObsidian');
 			mainButton.onclick = () => handleClipObsidian();
@@ -1324,17 +1394,28 @@ async function handleClipObsidian(): Promise<void> {
 	}
 
 	try {
-		// Handle interpreter if needed
-		if (generalSettings.interpreterEnabled && interpretBtn && collectPromptVariables(currentTemplate).length > 0) {
-			if (interpretBtn.classList.contains('processing')) {
-				await waitForInterpreter(interpretBtn);
-			} else if (!interpretBtn.classList.contains('done')) {
-				interpretBtn.click();
-				await waitForInterpreter(interpretBtn);
+			// Handle interpreter if needed
+			if (generalSettings.interpreterEnabled && interpretBtn && collectPromptVariables(currentTemplate).length > 0) {
+				if (interpretBtn.classList.contains('processing')) {
+					await waitForInterpreter(interpretBtn);
+				} else if (!interpretBtn.classList.contains('done')) {
+					interpretBtn.click();
+					await waitForInterpreter(interpretBtn);
+				}
 			}
-		}
 
-		// Gather content
+			// Let plugins finish in-flight work before clipping
+			for (const plugin of getPopupPlugins()) {
+				if (plugin.beforeClip) {
+					try {
+						await plugin.beforeClip();
+					} catch (e) {
+						console.warn(`Plugin ${plugin.id} beforeClip failed:`, e);
+					}
+				}
+			}
+
+			// Gather content
 		const properties = getPropertiesFromDOM();
 
 		const frontmatter = await generateFrontmatter(properties);
